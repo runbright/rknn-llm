@@ -7,6 +7,7 @@ import threading
 import time
 import argparse
 import json
+import atexit
 from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
@@ -34,6 +35,7 @@ RKLLMInferMode = ctypes.c_int
 RKLLMInferMode.RKLLM_INFER_GENERATE = 0
 RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER = 1
 RKLLMInferMode.RKLLM_INFER_GET_LOGITS = 2
+
 class RKLLMExtendParam(ctypes.Structure):
     _fields_ = [
         ("base_domain_id", ctypes.c_int32),
@@ -150,17 +152,19 @@ class RKLLMResult(ctypes.Structure):
         ("logits", RKLLMResultLogits)
     ]
 
-
 # Create a lock to control multi-user access to the server.
 lock = threading.Lock()
 
 # Create a global variable to indicate whether the server is currently in a blocked state.
 is_blocking = False
 
-# Define global variables to store the callback function output for displaying in the Gradio interface
+# Define global variables to store the callback function output
 global_text = ''
 global_state = -1
-split_byte_data = bytes(b"") # Used to store the segmented byte data
+split_byte_data = bytes(b"")
+
+# Global RKLLM model instance
+rkllm_model = None
 
 # Define the callback function
 def callback_impl(result, userdata, state):
@@ -176,13 +180,12 @@ def callback_impl(result, userdata, state):
     elif state == LLMCallState.RKLLM_RUN_NORMAL:
         global_state = state
         global_text += result.contents.text.decode('utf-8')
-    
 
 # Connect the callback function between the Python side and the C++ side
 callback_type = ctypes.CFUNCTYPE(None, ctypes.POINTER(RKLLMResult), ctypes.c_void_p, ctypes.c_int)
 callback = callback_type(callback_impl)
 
-# Define the RKLLM class, which includes initialization, inference, and release operations for the RKLLM model in the dynamic library
+# Define the RKLLM class
 class RKLLM(object):
     def __init__(self, model_path, lora_model_path = None, prompt_cache_path = None):
         rkllm_param = RKLLMParam()
@@ -228,11 +231,6 @@ class RKLLM(object):
         self.set_chat_template.argtypes = [RKLLM_Handle_t, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         self.set_chat_template.restype = ctypes.c_int
         
-        system_prompt = "<|im_start|>system You are a helpful assistant. <|im_end|>"
-        prompt_prefix = "<|im_start|>user"
-        prompt_postfix = "<|im_end|><|im_start|>assistant"
-        # self.set_chat_template(self.handle, ctypes.c_char_p(system_prompt.encode('utf-8')), ctypes.c_char_p(prompt_prefix.encode('utf-8')), ctypes.c_char_p(prompt_postfix.encode('utf-8')))
-
         self.rkllm_destroy = rkllm_lib.rkllm_destroy
         self.rkllm_destroy.argtypes = [RKLLM_Handle_t]
         self.rkllm_destroy.restype = ctypes.c_int
@@ -278,38 +276,34 @@ class RKLLM(object):
     def release(self):
         self.rkllm_destroy(self.handle)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--rkllm_model_path', type=str, required=True, help='Absolute path of the converted RKLLM model on the Linux board;')
-    parser.add_argument('--target_platform', type=str, required=True, help='Target platform: e.g., rk3588/rk3576;')
-    parser.add_argument('--lora_model_path', type=str, help='Absolute path of the lora_model on the Linux board;')
-    parser.add_argument('--prompt_cache_path', type=str, help='Absolute path of the prompt_cache file on the Linux board;')
-    args = parser.parse_args()
-
-    if not os.path.exists(args.rkllm_model_path):
+def initialize_model(model_path, target_platform, lora_model_path=None, prompt_cache_path=None):
+    """Initialize RKLLM model"""
+    global rkllm_model
+    
+    if not os.path.exists(model_path):
         print("Error: Please provide the correct rkllm model path, and ensure it is the absolute path on the board.")
         sys.stdout.flush()
-        exit()
+        return False
 
-    if not (args.target_platform in ["rk3588", "rk3576"]):
+    if not (target_platform in ["rk3588", "rk3576"]):
         print("Error: Please specify the correct target platform: rk3588/rk3576.")
         sys.stdout.flush()
-        exit()
+        return False
 
-    if args.lora_model_path:
-        if not os.path.exists(args.lora_model_path):
+    if lora_model_path:
+        if not os.path.exists(lora_model_path):
             print("Error: Please provide the correct lora_model path, and advise it is the absolute path on the board.")
             sys.stdout.flush()
-            exit()
+            return False
 
-    if args.prompt_cache_path:
-        if not os.path.exists(args.prompt_cache_path):
+    if prompt_cache_path:
+        if not os.path.exists(prompt_cache_path):
             print("Error: Please provide the correct prompt_cache_file path, and advise it is the absolute path on the board.")
             sys.stdout.flush()
-            exit()
+            return False
 
     # Fix frequency
-    command = "sudo bash fix_freq_{}.sh".format(args.target_platform)
+    command = "sudo bash fix_freq_{}.sh".format(target_platform)
     subprocess.run(command, shell=True)
 
     # Set resource limit
@@ -318,124 +312,156 @@ if __name__ == "__main__":
     # Initialize RKLLM model
     print("=========init....===========")
     sys.stdout.flush()
-    model_path = args.rkllm_model_path
-    rkllm_model = RKLLM(model_path, args.lora_model_path, args.prompt_cache_path)
+    rkllm_model = RKLLM(model_path, lora_model_path, prompt_cache_path)
     print("RKLLM Model has been initialized successfully！")
     print("==============================")
     sys.stdout.flush()
+    return True
 
-    # Create a function to receive data sent by the user using a request
-    @app.route('/rkllm_chat', methods=['POST'])
-    def receive_message():
-        # Link global variables to retrieve the output information from the callback function
-        global global_text, global_state
-        global is_blocking
+# Register cleanup function for graceful shutdown
+def cleanup():
+    global rkllm_model
+    if rkllm_model is not None:
+        print("====================")
+        print("RKLLM model inference completed, releasing RKLLM model resources...")
+        rkllm_model.release()
+        print("====================")
 
-        # If the server is in a blocking state, return a specific response.
-        if is_blocking or global_state==0:
-            return jsonify({'status': 'error', 'message': 'RKLLM_Server is busy! Maybe you can try again later.'}), 503
-        
-        lock.acquire()
-        try:
-            # Set the server to a blocking state.
-            is_blocking = True
+atexit.register(cleanup)
 
-            # Get JSON data from the POST request.
-            data = request.json
-            if data and 'messages' in data:
-                # Reset global variables.
-                global_text = []
-                global_state = -1
+# Flask route for RKLLM chat
+@app.route('/rkllm_chat', methods=['POST'])
+def receive_message():
+    global global_text, global_state, is_blocking, rkllm_model
 
-                # Define the structure for the returned response.
-                rkllm_responses = {
-                    "id": "rkllm_chat",
-                    "object": "rkllm_chat",
-                    "created": None,
-                    "choices": [],
-                    "usage": {
-                    "prompt_tokens": None,
-                    "completion_tokens": None,
-                    "total_tokens": None
-                    }
+    # Check if model is initialized
+    if rkllm_model is None:
+        return jsonify({'status': 'error', 'message': 'RKLLM model is not initialized!'}), 500
+
+    # If the server is in a blocking state, return a specific response.
+    if is_blocking or global_state==0:
+        return jsonify({'status': 'error', 'message': 'RKLLM_Server is busy! Maybe you can try again later.'}), 503
+    
+    lock.acquire()
+    try:
+        # Set the server to a blocking state.
+        is_blocking = True
+
+        # Get JSON data from the POST request.
+        data = request.json
+        if data and 'messages' in data:
+            # Reset global variables.
+            global_text = []
+            global_state = -1
+
+            # Define the structure for the returned response.
+            rkllm_responses = {
+                "id": "rkllm_chat",
+                "object": "rkllm_chat",
+                "created": None,
+                "choices": [],
+                "usage": {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None
                 }
+            }
 
-                if not "stream" in data.keys() or data["stream"] == False:
-                    # Process the received data here.
-                    messages = data['messages']
-                    print("Received messages:", messages)
-                    for index, message in enumerate(messages):
-                        input_prompt = message['content']
-                        rkllm_output = ""
-                        
-                        # Create a thread for model inference.
+            if not "stream" in data.keys() or data["stream"] == False:
+                # Process the received data here.
+                messages = data['messages']
+                print("Received messages:", messages)
+                for index, message in enumerate(messages):
+                    input_prompt = message['content']
+                    rkllm_output = ""
+                    
+                    # Create a thread for model inference.
+                    model_thread = threading.Thread(target=rkllm_model.run, args=(input_prompt,))
+                    model_thread.start()
+
+                    # Wait for the model to finish running and periodically check the inference thread of the model.
+                    model_thread_finished = False
+                    while not model_thread_finished:
+                        while len(global_text) > 0:
+                            rkllm_output += global_text.pop(0)
+                            time.sleep(0.005)
+
+                        model_thread.join(timeout=0.005)
+                        model_thread_finished = not model_thread.is_alive()
+                    
+                    rkllm_responses["choices"].append(
+                        {"index": index,
+                        "message": {
+                            "role": "assistant",
+                            "content": rkllm_output,
+                        },
+                        "logprobs": None,
+                        "finish_reason": "stop"
+                        }
+                    )
+                return jsonify(rkllm_responses), 200
+            else:
+                messages = data['messages']
+                print("Received messages:", messages)
+                for index, message in enumerate(messages):
+                    input_prompt = message['content']
+                    rkllm_output = ""
+                    
+                    def generate():
                         model_thread = threading.Thread(target=rkllm_model.run, args=(input_prompt,))
                         model_thread.start()
 
-                        # Wait for the model to finish running and periodically check the inference thread of the model.
                         model_thread_finished = False
                         while not model_thread_finished:
                             while len(global_text) > 0:
-                                rkllm_output += global_text.pop(0)
-                                time.sleep(0.005)
+                                rkllm_output = global_text.pop(0)
+
+                                rkllm_responses["choices"].append(
+                                    {"index": index,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": rkllm_output,
+                                    },
+                                    "logprobs": None,
+                                    "finish_reason": "stop" if global_state == 1 else None,
+                                    }
+                                )
+                                yield f"{json.dumps(rkllm_responses)}\n\n"
 
                             model_thread.join(timeout=0.005)
                             model_thread_finished = not model_thread.is_alive()
-                        
-                        rkllm_responses["choices"].append(
-                            {"index": index,
-                            "message": {
-                                "role": "assistant",
-                                "content": rkllm_output,
-                            },
-                            "logprobs": None,
-                            "finish_reason": "stop"
-                            }
-                        )
-                    return jsonify(rkllm_responses), 200
-                else:
-                    messages = data['messages']
-                    print("Received messages:", messages)
-                    for index, message in enumerate(messages):
-                        input_prompt = message['content']
-                        rkllm_output = ""
-                        
-                        def generate():
-                            model_thread = threading.Thread(target=rkllm_model.run, args=(input_prompt,))
-                            model_thread.start()
 
-                            model_thread_finished = False
-                            while not model_thread_finished:
-                                while len(global_text) > 0:
-                                    rkllm_output = global_text.pop(0)
+                return Response(generate(), content_type='text/plain')
+        else:
+            return jsonify({'status': 'error', 'message': 'Invalid JSON data!'}), 400
+    finally:
+        lock.release()
+        is_blocking = False
 
-                                    rkllm_responses["choices"].append(
-                                        {"index": index,
-                                        "delta": {
-                                            "role": "assistant",
-                                            "content": rkllm_output,
-                                        },
-                                        "logprobs": None,
-                                        "finish_reason": "stop" if global_state == 1 else None,
-                                        }
-                                    )
-                                    yield f"{json.dumps(rkllm_responses)}\n\n"
+# For command line execution
+def parse_args_and_init():
+    """Parse command line arguments and initialize model"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--rkllm_model_path', type=str, required=True, help='Absolute path of the converted RKLLM model on the Linux board;')
+    parser.add_argument('--target_platform', type=str, required=True, help='Target platform: e.g., rk3588/rk3576;')
+    parser.add_argument('--lora_model_path', type=str, help='Absolute path of the lora_model on the Linux board;')
+    parser.add_argument('--prompt_cache_path', type=str, help='Absolute path of the prompt_cache file on the Linux board;')
+    args = parser.parse_args()
 
-                                model_thread.join(timeout=0.005)
-                                model_thread_finished = not model_thread.is_alive()
-
-                    return Response(generate(), content_type='text/plain')
-            else:
-                return jsonify({'status': 'error', 'message': 'Invalid JSON data!'}), 400
-        finally:
-            lock.release()
-            is_blocking = False
+    # Initialize model with parsed arguments
+    success = initialize_model(
+        args.rkllm_model_path,
+        args.target_platform,
+        args.lora_model_path,
+        args.prompt_cache_path
+    )
+    
+    if not success:
+        exit(1)
         
-    # Start the Flask application.
-    # app.run(host='0.0.0.0', port=8080)
-    app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
+    return args
 
-    print("====================")
-    print("RKLLM model inference completed, releasing RKLLM model resources...")
-    rkllm_model.release()
-    print("====================")
+# For direct execution (development mode)
+if __name__ == "__main__":
+    parse_args_and_init()
+    app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
